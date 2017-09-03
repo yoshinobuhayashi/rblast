@@ -1,0 +1,196 @@
+#!/usr/bin/env ruby
+
+# require 'parallel'
+require 'optparse'
+require 'zlib'
+
+
+### default parameters
+# blast parameters
+blast = true
+bitscore = 0
+evalue = "1e-6"
+maxtarseq = 5
+aligncoverage = 0
+threads = 2
+# output file & directories
+outputfile = "ReciprocalBestHits.txt"
+blastoutdir = "blastout"
+temporaldir = "temp"
+
+
+### option parser
+opt = OptionParser.new
+inputs = Array.new
+outgroup = String.new
+opt.on('-1 FILE', '--input1 FILE', 'input file 1 [required]') {|x| inputs << x.chomp}
+opt.on('-2 FILE', '--input2 FILE', 'input file 2 [required]') {|x| inputs << x.chomp}
+opt.on('-o OUTPUT_FILE', '--output_file OUTPUT_FILE', 'output file [default: rbh.out]') {|x| outputfile = x}
+opt.on('-n', '--noblast', 'BLAST will not be performed [default: performs BLAST]') {blast = !blast }
+opt.on('-e EVALUE', '--evalue EVALUE', '[default: 1e-6]') {|x| evalue = x}
+opt.on('-s SCORE', '--score_threshold SCORE', '[default: 0]') {|x| bitscore = x.to_f}
+opt.on('-a ALIGNMENT_COVERAGE', '--alignment_coverage ALIGNMENT_COVERAGE', '[default: 0]') {|x| aligncovrage = x.to_f}
+opt.on('-m MAX_TARGET_SEQS', '--max_target_seqs MAX_TARGET_SEQS', '[default: 5]') {|x| maxtarseq = x}
+opt.on('-d TEMPORAL_DIR', '--temporal_dir TEMPORAL_DIR', '[default: temp]') {|x| temporaldir = x}
+opt.on('-t NUM_THREADS', '--threads NUM_THREADS', '[default: 2]') {|x| threads = x}
+# opt.on('-c NUM_THREADS_PER_PROCESS', '--cpu NUM_THREADS_PER_PROCESS', '[default: 2]') {|x| threads = x}
+opt.on('-h', '--help', 'show this message') {puts opt ; exit}
+opt.parse!(ARGV)
+
+
+module ReciprocalBlast
+  module_function
+
+  ## make blastdb for all input files
+  def mkdb(inputs, outdir)
+    @inputbasename = []
+    @name2path = {}
+    inputs.each do |i|
+      x = File.basename(i, ".*")
+      @inputbasename << x
+      @name2path[x] = i
+    end
+    inputs.each do |path|
+      dbname = @name2path.select {|k,v| v == path}.keys[0]
+      param = "-in #{path} -out #{outdir}/#{dbname} -title #{dbname} -dbtype prot"
+      `makeblastdb #{param}`
+    end
+  end
+
+  ## performs reciprocal blast
+  def rblast(evalue, maxtarseq, threads, blastoutdir, temporaldir)
+    blastpair = []
+    input1 = @inputbasename[0]
+    input2 = @inputbasename[1]
+    blastpair << [input1, input2]
+    blastpair << [input2, input1]
+    blastpair.each do |i| # Parallel.each(blastpair, :in_processes=>2) do |i|
+      query = @name2path[i[0]]
+      subject = i[1]
+      blastoutput = "#{blastoutdir}/BLASTP.#{i[0]}--#{i[1]}.xml"
+      param = \
+      "-query #{query} -db #{temporaldir}/#{subject} -out #{blastoutput} " +
+      "-evalue #{evalue} -outfmt 5 -max_target_seqs #{maxtarseq} -num_threads #{threads}"
+      `blastp #{param}`
+    end
+  end
+
+end
+
+
+module Report
+   module_function
+
+   def parse(file, evalue, bitscore, aligncoverage)
+      hash_blastout = {}
+      File.open(file).each("</Iteration>") do |i|
+        qdef = i.slice(/<Iteration_query-def>(.+?)(<\/|\s)/, 1)
+        qlen = i.slice(/<Iteration_query-len>(.+?)<\/Iteration_query-len>/, 1).to_f
+        next unless qdef
+        next unless /<Hit>/ =~ i
+        hash_blastout[qdef] = []
+        hit = i.slice(/<Hit_num>1<\/Hit_num>(.+?)<\/Hsp>/m, 1)
+        eval = hit.slice(/<Hsp_evalue>(.+?)<\/Hsp_evalue>/, 1).to_f
+        bit = hit.slice(/<Hsp_bit-score>(.+?)<\/Hsp_bit-score>/, 1).to_f
+        qstart = hit.slice(/<Hsp_query-from>(.+?)<\/Hsp_query-from>/, 1).to_f
+        qend = hit.slice(/<Hsp_query-to>(.+?)<\/Hsp_query-to>/, 1).to_f
+        acov = (qend - qstart + 1) / qlen
+        if eval < evalue.to_f && bit > bitscore && acov >= aligncoverage
+          sdef = hit.slice(/<Hit_def>(.+?)(<\/|\s)/, 1)
+          hitnum = hit.slice(/<Hit_num>(.+?)<\/Hit_num>/, 1)
+          slen = hit.slice(/<Hit_len>(.+?)<\/Hit_len>/, 1)
+          eval = hit.slice(/<Hsp_evalue>(.+?)<\/Hsp_evalue>/, 1)
+          sstart = hit.slice(/<Hsp_hit-from>(.+?)<\/Hsp_hit-from>/, 1)
+          send = hit.slice(/<Hsp_hit-to>(.+?)<\/Hsp_hit-to>/, 1)
+          qframe = hit.slice(/<Hsp_query-frame>(.+?)<\/Hsp_query-frame>/, 1)
+          sframe = hit.slice(/<Hsp_hit-frame>(.+?)<\/Hsp_hit-frame>/, 1)
+          ident = hit.slice(/<Hsp_identity>(.+?)<\/Hsp_identity>/, 1).to_f
+          posit = hit.slice(/<Hsp_positive>(.+?)<\/Hsp_positive>/, 1).to_f
+          gaps = hit.slice(/<Hsp_gaps>(.+?)<\/Hsp_gaps>/, 1)
+          alen = hit.slice(/<Hsp_align-len>(.+?)<\/Hsp_align-len>/, 1).to_f
+          pident = "%.1f" % [100 * ident / alen]
+          pposit = "%.1f" % [100 * posit / alen]
+          result = [hitnum, sdef, eval, bit, pident, pposit, gaps, alen, qlen, slen, qstart, qend, sstart, send]
+          hash_blastout[qdef] = result
+         end
+      end
+      return hash_blastout
+   end
+
+   def besthit_pair(h1, h2)
+      hash_bhpairs = {}
+      h1.each do |q, s|
+        if x = h2[s[1]]
+          hash_bhpairs[q] = s[1] if x[1] == q
+        end
+      end
+      return hash_bhpairs
+   end
+
+   def write_result(file, hash)
+      File.open(file, "w") do |f|
+        f.print "qdef\tsdef\teval\tbit\tpident\tpposit\tgaps\talen\tqlen\tslen\tqstart\tqend\tsstart\tsend\n"
+        hash.sort.each do |i|
+          blast = i[1]
+          blast.shift
+          f.print i[0] + "\t" + blast.join("\t") + "\n"
+        end
+      end
+   end
+
+end
+
+
+if Dir.exist?(temporaldir)
+  files = Dir.glob("#{temporaldir}/*")
+  files.each {|f| File.delete(f)}
+  Dir.rmdir(temporaldir)
+  Dir.mkdir(temporaldir)
+else
+  Dir.mkdir(temporaldir)
+end
+
+if blast
+   if Dir.exist?(blastoutdir)
+      files = Dir.glob("#{blastoutdir}/*")
+      files.each {|f| File.delete(f)}
+      Dir.rmdir(blastoutdir)
+      Dir.mkdir(blastoutdir)
+   else
+      Dir.mkdir(blastoutdir)
+   end
+   ReciprocalBlast.mkdb(inputs, temporaldir)
+   ReciprocalBlast.rblast(evalue, maxtarseq, threads, blastoutdir, temporaldir)
+end
+
+filename1 = File.basename(inputs[0], ".*")
+filename2 = File.basename(inputs[1], ".*")
+
+bfile1 = "#{blastoutdir}/BLASTP.#{filename1}--#{filename2}.xml"
+bfile2 = "#{blastoutdir}/BLASTP.#{filename2}--#{filename1}.xml"
+h1 = Report.parse(bfile1, evalue, bitscore, aligncoverage)
+h2 = Report.parse(bfile2, evalue, bitscore, aligncoverage)
+hash_bhpairs = Report.besthit_pair(h1, h2)
+
+
+File.open(outputfile, "w") do |f|
+  hash_bhpairs.sort.each do |i|
+    f.print i[0] + "\t" + i[1] + "\n"
+  end
+end
+
+Report.write_result("Blast_Input1to2.txt", h1)
+Report.write_result("Blast_Input2to1.txt", h2)
+
+bfiles = [bfile1, bfile2]
+bfiles.each do |f| # Parallel.each(bfiles, :in_processes=>2) do |f|
+  Zlib::GzipWriter.open("#{f}.gz") do |gz|
+    File.open(f).each do |line|
+      gz.puts line
+    end
+  end
+end
+
+Dir.glob("#{blastoutdir}/*.xml").each { |f| File.delete(f) }
+Dir.glob("#{temporaldir}/*.p*").each { |f| File.delete(f) }
+Dir.rmdir(temporaldir)
